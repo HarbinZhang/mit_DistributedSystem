@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync/atomic"
 	"time"
 )
 
@@ -96,67 +97,76 @@ func (rf *Raft) elect() {
 		Term:        rf.currentTerm,
 		CandidateID: rf.me,
 	}
+
+	voted := int32(1)
+	total := int32(len(rf.peers))
+	half := total / 2
+
+	done := make(chan struct{})
+	finish := make(chan struct{})
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 
-		reply := &RequestVoteReply{}
-		go rf.sendRequestVote(i, req, reply)
+		go func(i int) {
+			defer func() {
+				if atomic.AddInt32(&total, -1) == 0 {
+					close(done)
+				}
+			}()
+
+			reply := &RequestVoteReply{}
+
+			log.Printf("Term(%d): sending Raft.RequestVote RPC from peer(%d) to peer(%d)", req.Term, rf.me, i)
+			if !rf.sendRequestVote(i, req, reply) {
+				log.Printf("Term(%d): sent Raft.RequestVote RPC from peer(%d) to peer(%d) failed", req.Term, rf.me, i)
+				return
+			}
+
+			rf.lock.Lock()
+			defer rf.lock.Unlock()
+
+			if rf.currentTerm != req.Term {
+				return
+			}
+
+			if reply.VoteGranted {
+				log.Printf("Term(%d): peer(%d) got a vote from peer(%d)", req.Term, rf.me, i)
+				if atomic.AddInt32(&voted, 1) == half+1 {
+					close(finish)
+					log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
+					// rf.resetLeader(rf.me)
+
+					// for i := 0; i < len(rf.matchIndex); i++ {
+					// 	if i != rf.me {
+					// 		rf.nextIndex[i] = len(rf.log)
+					// 		rf.matchIndex[i] = -1
+					// 	}
+					// }
+				}
+			}
+
+		}(i)
 	}
 
-	halfPeers := len(rf.peers) / 2
-	voted := 1
-loop:
-	for true {
-		select {
-		case reply := <-rf.voteReplyChan:
-			fmt.Printf("reply:%v", reply)
-			if reply.Term > rf.currentTerm {
-
-				rf.lock.Lock()
-				rf.currentTerm = reply.Term
-				rf.state = Follower
-				rf.lock.Unlock()
-
-				break loop
-			} else if reply.Term < rf.currentTerm {
-				continue
-			} else if reply.VoteGranted {
-				voted++
-				if voted > halfPeers {
-
-					log.Printf("it's ok, voted(%d), quarum(%d), to be a leader(%d)", voted, halfPeers, rf.me)
-
-					rf.lock.Lock()
-					rf.leaderID = rf.me
-					rf.state = Leader
-					go rf.sendHeartbeat(rf.done)
-					rf.lock.Unlock()
-
-					return
-				}
-			} else {
-				// log.
-				break loop
-			}
-		}
+	select {
+	case <-done:
+	case <-finish:
+	case <-rf.done:
 	}
 
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	rf.voteReplyChan <- reply
-	log.Printf("Term(%d): peer(%d) got RequestVoteReply from peer(%d) with term(%d)",
-		rf.currentTerm, rf.me, server, reply.Term)
 	return ok
 }
 
-func (rf *Raft) sendHeartbeat(quit chan struct{}) bool {
+func (rf *Raft) sendHeartbeat(quit chan struct{}) {
 	if rf.state != Leader {
 		log.Panicln("Not the leader.")
-		return false
+		return
 	}
 	args := &AppendEntriesArgs{
 		Term:     rf.currentTerm,
@@ -167,56 +177,66 @@ func (rf *Raft) sendHeartbeat(quit chan struct{}) bool {
 	for true {
 		select {
 		case <-heartbeatTicker.C:
+			rf.lock.Lock()
 			rf.lastHeartbeatTime = time.Now()
+			rf.lock.Unlock()
+
+			total := int32(len(rf.peers))
+			successNum := int32(1)
+			half := total / 2
+
+			done := make(chan struct{})
+			finish := make(chan struct{})
+
 			for i, _ := range rf.peers {
 				if i == rf.me {
 					continue
 				}
-				reply := &AppendEntriesReply{}
-				go rf.sendHeartbeatRequset(i, args, reply)
-			}
 
-			replyNum := 1
-			successNum := 1
-			for reply := range rf.heartbeatReplyChan {
-				replyNum++
-				if reply.Success {
-					successNum++
-				}
-				if replyNum == len(rf.peers) {
-					break
-				}
-			}
+				go func(i int) {
+					defer func() {
+						if atomic.AddInt32(&total, -1) == 0 {
+							if successNum < half+1 {
+								log.Printf("Term(%d): Leader peer(%d) is NOT working fine on Leader",
+									rf.currentTerm, rf.me)
+								rf.lock.Lock()
+								rf.state = Follower
+								rf.lock.Unlock()
+							}
+							close(done)
+						}
 
-			if successNum > len(rf.peers)/2 {
-				log.Printf("Term(%d): Leader peer(%d) is working fine on Leader",
-					rf.currentTerm, rf.me)
-			} else {
-				rf.lock.Lock()
-				defer rf.lock.Unlock()
-				log.Printf("Term(%d): Leader peer(%d) is NOT working fine on Leader",
-					rf.currentTerm, rf.me)
-				rf.state = Follower
+					}()
+
+					reply := &AppendEntriesReply{}
+					rf.sendHeartbeatRequset(i, args, reply)
+
+					if reply.Success {
+						if atomic.AddInt32(&successNum, 1) == half+1 {
+							// log.Printf("Term(%d): Leader peer(%d) is working fine on Leader",
+							// rf.currentTerm, rf.me)
+							close(finish)
+						}
+					}
+
+				}(i)
+			}
+			select {
+			case <-done:
+			case <-finish:
+			case <-rf.done:
 			}
 		case <-quit:
 			log.Printf("Term(%d): Leader peer(%d) quit", rf.currentTerm, rf.me)
 			heartbeatTicker.Stop()
-			return true
+			return
 		}
 	}
 
-	return true
+	return
 }
 
 func (rf *Raft) sendHeartbeatRequset(i int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	log.Printf("Term(%d): Leader send Heartbeat to peer(%d) with term(%d)",
-		rf.currentTerm, i, reply.Term)
 	ok := rf.peers[i].Call("Raft.Heartbeat", args, reply)
-	if !ok {
-		return false
-	}
-	rf.heartbeatReplyChan <- reply
-	log.Printf("Term(%d): peer(%d) got Heartbeat Reply from peer(%d) with term(%d)",
-		rf.currentTerm, rf.me, i, reply.Term)
-	return true
+	return ok
 }
