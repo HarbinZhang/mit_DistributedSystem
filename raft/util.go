@@ -23,7 +23,7 @@ func (rf *Raft) election() {
 	for {
 		if _, isLeader := rf.GetState(); isLeader {
 			// electionTimeout = time.Duration(rand.Intn(25)+minHeartbeatTimeout) * time.Millisecond
-			electionTimeout = time.Duration(rand.Intn(150)+minElectionTimeout) * time.Millisecond
+			electionTimeout = time.Duration(rand.Intn(20)+minElectionTimeout) * time.Millisecond
 		} else {
 			electionTimeout = time.Duration(rand.Intn(150)+minElectionTimeout) * time.Millisecond
 		}
@@ -42,17 +42,17 @@ func (rf *Raft) election() {
 				// log.Printf("Term(%d): peer(%d) timeout for heartbeat", rf.currentTerm, rf.me)
 			}
 			if _, isLeader := rf.GetState(); isLeader {
-				rf.lock.RLock()
+				// rf.lock.RLock()
 				// log.Printf("Term(%d): peer(%d) starts a periodical heartbeat", rf.currentTerm, rf.me)
-				rf.lock.RUnlock()
+				// rf.lock.RUnlock()
 
 				// go rf.sendHeartbeat()
 				// go rf.replicate(100)
 			} else {
-				rf.lock.RLock()
-				rf.votedFor = -1
-				log.Printf("Term(%d): peer(%d) starts a new election", rf.currentTerm, rf.me)
-				rf.lock.RUnlock()
+				// rf.lock.RLock()
+
+				// log.Printf("Term(%d): peer(%d) starts a new election", rf.currentTerm, rf.me)
+				// rf.lock.RUnlock()
 
 				go rf.elect()
 				// break
@@ -87,6 +87,7 @@ func (rf *Raft) elect() {
 	fmt.Println("Into elect")
 
 	rf.lock.Lock()
+	rf.votedFor = -1
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.lock.Unlock()
@@ -106,6 +107,7 @@ func (rf *Raft) elect() {
 
 	halfPeers := len(rf.peers) / 2
 	voted := 1
+loop:
 	for true {
 		select {
 		case reply := <-rf.voteReplyChan:
@@ -117,7 +119,7 @@ func (rf *Raft) elect() {
 				rf.state = Follower
 				rf.lock.Unlock()
 
-				break
+				break loop
 			} else if reply.Term < rf.currentTerm {
 				continue
 			} else if reply.VoteGranted {
@@ -136,6 +138,7 @@ func (rf *Raft) elect() {
 				}
 			} else {
 				// log.
+				break loop
 			}
 		}
 	}

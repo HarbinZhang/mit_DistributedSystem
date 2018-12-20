@@ -10,6 +10,7 @@ package raft
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -43,9 +44,6 @@ func TestInitialElection2A(t *testing.T) {
 		fmt.Printf("warning: term changed even though there were no failures")
 	}
 
-	// there should still be a leader.
-	cfg.checkOneLeader()
-
 	cfg.end()
 }
 
@@ -62,25 +60,23 @@ func TestReElection2A(t *testing.T) {
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
-	// // if the old leader rejoins, that shouldn't
-	// // disturb the new leader.
+	// if the old leader rejoins, that shouldn't
+	// disturb the new leader.
 	cfg.connect(leader1)
-	// cfg.checkOneLeader()
-
 	leader2 := cfg.checkOneLeader()
 
-	// // if there's no quorum, no leader should
-	// // be elected.
+	// if there's no quorum, no leader should
+	// be elected.
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 	cfg.checkNoLeader()
 
-	// // if a quorum arises, it should elect a leader.
+	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
-	// // re-join of last node shouldn't prevent leader from existing.
+	// re-join of last node shouldn't prevent leader from existing.
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
 
@@ -95,7 +91,7 @@ func TestBasicAgree2B(t *testing.T) {
 	cfg.begin("Test (2B): basic agreement")
 
 	iters := 3
-	for index := 1; index < iters+1; index++ {
+	for index := 0; index < iters; index++ {
 		nd, _ := cfg.nCommitted(index)
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
@@ -160,8 +156,8 @@ func TestFailNoAgree2B(t *testing.T) {
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
 	}
-	if index != 2 {
-		t.Fatalf("expected index 2, got %v", index)
+	if index != 1 {
+		t.Fatalf("expected index 1, got %v", index)
 	}
 
 	time.Sleep(2 * RaftElectionTimeout)
@@ -177,13 +173,13 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.connect((leader + 3) % servers)
 
 	// the disconnected majority may have chosen a leader from
-	// among their own ranks, forgetting index 2.
+	// among their own ranks, forgetting index 1.
 	leader2 := cfg.checkOneLeader()
 	index2, _, ok2 := cfg.rafts[leader2].Start(30)
 	if ok2 == false {
 		t.Fatalf("leader2 rejected Start()")
 	}
-	if index2 < 2 || index2 > 3 {
+	if index2 < 1 || index2 > 2 {
 		t.Fatalf("unexpected index %v", index2)
 	}
 
@@ -346,6 +342,11 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
 
+	log.Println("leader1 is", leader1)
+	log.Println("disconnect", (leader1+2)%servers)
+	log.Println("disconnect", (leader1+3)%servers)
+	log.Println("disconnect", (leader1+4)%servers)
+
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
@@ -356,10 +357,17 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
 
+	log.Println("disconnect", (leader1+0)%servers)
+	log.Println("disconnect", (leader1+1)%servers)
+
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
+
+	log.Println("connect", (leader1+2)%servers)
+	log.Println("connect", (leader1+3)%servers)
+	log.Println("connect", (leader1+4)%servers)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
@@ -374,6 +382,9 @@ func TestBackup2B(t *testing.T) {
 	}
 	cfg.disconnect(other)
 
+	log.Println("leader2 is", leader2)
+	log.Println("disconnect", other)
+
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
@@ -384,10 +395,15 @@ func TestBackup2B(t *testing.T) {
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
+		log.Println("disconnect", i)
 	}
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
+
+	log.Println("connect", (leader1+0)%servers)
+	log.Println("connect", (leader1+1)%servers)
+	log.Println("connect", other)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
@@ -397,6 +413,7 @@ func TestBackup2B(t *testing.T) {
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
+		log.Println("connect", i)
 	}
 	cfg.one(rand.Int(), servers, true)
 
@@ -546,7 +563,7 @@ func TestPersist12C(t *testing.T) {
 	cfg.start1(leader2)
 	cfg.connect(leader2)
 
-	cfg.wait(4, servers, -1) // wait for leader2 to join before killing i3
+	cfg.wait(3, servers, -1) // wait for leader2 to join before killing i3
 
 	i3 := (cfg.checkOneLeader() + 1) % servers
 	cfg.disconnect(i3)
@@ -640,7 +657,7 @@ func TestPersist32C(t *testing.T) {
 // iteration asks a leader, if there is one, to insert a command in the Raft
 // log.  If there is a leader, that leader will fail quickly with a high
 // probability (perhaps without committing the command), or crash after a while
-// with low probability (most likey committing the command).  If the number of
+// with low probability (most likely committing the command).  If the number of
 // alive servers isn't enough to form a majority, perhaps start a new server.
 // The leader in a new term may try to finish replicating log entries that
 // haven't been committed yet.
@@ -906,7 +923,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 	lastIndex := cfg.one(rand.Int(), servers, true)
 
 	really := make([]int, lastIndex+1)
-	for index := 1; index <= lastIndex; index++ {
+	for index := 0; index < lastIndex; index++ {
 		v := cfg.wait(index, servers, -1)
 		if vi, ok := v.(int); ok {
 			really = append(really, vi)
