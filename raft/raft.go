@@ -90,7 +90,7 @@ type Raft struct {
 	// // indicates whether the server is done
 	done chan struct{}
 	// // indicates whether the election timer resets
-	// resetElectionTimer chan struct{}
+	resetElectionTimer chan struct{}
 	// the current leader ID, -1 means none
 	leaderID int
 	// wake up if leader changes
@@ -245,7 +245,10 @@ func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 		rf.leaderID = args.LeaderId
 		rf.state = Follower
 		rf.lastHeartbeatTime = time.Now()
+
+		rf.resetElectionTimer <- struct{}{}
 	}
+
 }
 
 //

@@ -58,18 +58,18 @@ func (rf *Raft) election() {
 				go rf.elect()
 				// break
 			}
-			// case <-rf.leaderChange:
-			// 	if _, isLeader := rf.GetState(); isLeader {
-			// 		rf.lock.RLock()
-			// 		log.Printf("Term(%d): peer(%d) starts an instant heartbeat", rf.currentTerm, rf.me)
-			// 		rf.lock.RUnlock()
+		// case <-rf.leaderChange:
+		// 	if _, isLeader := rf.GetState(); isLeader {
+		// 		rf.lock.RLock()
+		// 		log.Printf("Term(%d): peer(%d) starts an instant heartbeat", rf.currentTerm, rf.me)
+		// 		rf.lock.RUnlock()
 
-			// 		go rf.replicate(0)
-			// 	}
-			// case <-rf.resetElectionTimer:
-			// 	rf.lock.RLock()
-			// 	log.Printf("Term(%d): peer(%d) resets election timer", rf.currentTerm, rf.me)
-			// 	rf.lock.RUnlock()
+		// 		go rf.replicate(0)
+		// 	}
+		case <-rf.resetElectionTimer:
+			rf.lock.RLock()
+			log.Printf("Term(%d): peer(%d) resets election timer", rf.currentTerm, rf.me)
+			rf.lock.RUnlock()
 			// case <-rf.done:
 			// 	rf.lock.RLock()
 			// 	log.Printf("Term(%d): peer(%d) quits", rf.currentTerm, rf.me)
@@ -137,6 +137,9 @@ func (rf *Raft) elect() {
 					close(finish)
 					log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
 					// rf.resetLeader(rf.me)
+					rf.leaderID = rf.me
+					rf.state = Leader
+					go rf.sendHeartbeat(rf.done)
 
 					// for i := 0; i < len(rf.matchIndex); i++ {
 					// 	if i != rf.me {
