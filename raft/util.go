@@ -24,57 +24,44 @@ func (rf *Raft) election() {
 	for {
 		if _, isLeader := rf.GetState(); isLeader {
 			// electionTimeout = time.Duration(rand.Intn(25)+minHeartbeatTimeout) * time.Millisecond
-			electionTimeout = time.Duration(rand.Intn(20)+minElectionTimeout) * time.Millisecond
+			electionTimeout = time.Duration(rand.Intn(20)+minHeartbeatTimeout) * time.Millisecond
 		} else {
-			electionTimeout = time.Duration(rand.Intn(150)+minElectionTimeout) * time.Millisecond
+			electionTimeout = time.Duration(rand.Intn(200)+minElectionTimeout) * time.Millisecond
 		}
 		select {
 		case <-time.After(electionTimeout):
-			log.Printf("Term(%d): peer(%d) election timeout", rf.currentTerm, rf.me)
-			if time.Since(rf.lastHeartbeatTime) < electionTimeout {
-				fmt.Printf("continue(%d)", rf.me)
-				fmt.Println(time.Since(rf.lastHeartbeatTime))
-				fmt.Println(electionTimeout)
-				continue
-			} else {
-				fmt.Printf("timeout(%d)", rf.me)
-				fmt.Println(time.Since(rf.lastHeartbeatTime))
-				fmt.Println(electionTimeout)
-				// log.Printf("Term(%d): peer(%d) timeout for heartbeat", rf.currentTerm, rf.me)
-			}
+			log.Printf("Term(%d): peer(%d) election timeout %v", rf.currentTerm, rf.me, electionTimeout)
 			if _, isLeader := rf.GetState(); isLeader {
-				// rf.lock.RLock()
-				// log.Printf("Term(%d): peer(%d) starts a periodical heartbeat", rf.currentTerm, rf.me)
-				// rf.lock.RUnlock()
+				rf.lock.RLock()
+				log.Printf("Term(%d): peer(%d) starts a periodical heartbeat", rf.currentTerm, rf.me)
+				rf.lock.RUnlock()
 
-				// go rf.sendHeartbeat()
+				go rf.sendHeartbeat()
 				// go rf.replicate(100)
 			} else {
-				// rf.lock.RLock()
-
-				// log.Printf("Term(%d): peer(%d) starts a new election", rf.currentTerm, rf.me)
-				// rf.lock.RUnlock()
+				rf.lock.RLock()
+				log.Printf("Term(%d): peer(%d) starts a new election", rf.currentTerm, rf.me)
+				rf.lock.RUnlock()
 
 				go rf.elect()
-				// break
 			}
-		// case <-rf.leaderChange:
-		// 	if _, isLeader := rf.GetState(); isLeader {
-		// 		rf.lock.RLock()
-		// 		log.Printf("Term(%d): peer(%d) starts an instant heartbeat", rf.currentTerm, rf.me)
-		// 		rf.lock.RUnlock()
-
-		// 		go rf.replicate(0)
-		// 	}
+		case <-rf.leaderChange:
+			if _, isLeader := rf.GetState(); isLeader {
+				rf.lock.RLock()
+				log.Printf("Term(%d): peer(%d) starts an instant heartbeat", rf.currentTerm, rf.me)
+				rf.lock.RUnlock()
+				// go rf.replicate(0)
+				go rf.sendHeartbeat()
+			}
 		case <-rf.resetElectionTimer:
 			rf.lock.RLock()
 			log.Printf("Term(%d): peer(%d) resets election timer", rf.currentTerm, rf.me)
 			rf.lock.RUnlock()
-			// case <-rf.done:
-			// 	rf.lock.RLock()
-			// 	log.Printf("Term(%d): peer(%d) quits", rf.currentTerm, rf.me)
-			// 	rf.lock.RUnlock()
-			// 	return
+		case <-rf.done:
+			rf.lock.RLock()
+			log.Printf("Term(%d): peer(%d) quits", rf.currentTerm, rf.me)
+			rf.lock.RUnlock()
+			return
 		}
 	}
 }
@@ -134,12 +121,18 @@ func (rf *Raft) elect() {
 			if reply.VoteGranted {
 				log.Printf("Term(%d): peer(%d) got a vote from peer(%d)", req.Term, rf.me, i)
 				if atomic.AddInt32(&voted, 1) == half+1 {
-					close(finish)
+
 					log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
 					// rf.resetLeader(rf.me)
+
 					rf.leaderID = rf.me
 					rf.state = Leader
-					go rf.sendHeartbeat(rf.done)
+
+					fmt.Println(rf.GetState())
+
+					rf.leaderChange <- struct{}{}
+
+					close(finish)
 
 					// for i := 0; i < len(rf.matchIndex); i++ {
 					// 	if i != rf.me {
@@ -166,7 +159,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendHeartbeat(quit chan struct{}) {
+func (rf *Raft) sendHeartbeat() {
 	if rf.state != Leader {
 		log.Panicln("Not the leader.")
 		return
@@ -175,65 +168,55 @@ func (rf *Raft) sendHeartbeat(quit chan struct{}) {
 		Term:     rf.currentTerm,
 		LeaderId: rf.me,
 	}
-	heartbeatTicker := time.NewTicker(minHeartbeatTimeout)
 
-	for true {
-		select {
-		case <-heartbeatTicker.C:
-			rf.lock.Lock()
-			rf.lastHeartbeatTime = time.Now()
-			rf.lock.Unlock()
+	rf.lock.Lock()
+	rf.lastHeartbeatTime = time.Now()
+	rf.lock.Unlock()
 
-			total := int32(len(rf.peers))
-			successNum := int32(1)
-			half := total / 2
+	total := int32(len(rf.peers))
+	successNum := int32(1)
+	half := total / 2
 
-			done := make(chan struct{})
-			finish := make(chan struct{})
+	done := make(chan struct{})
+	finish := make(chan struct{})
 
-			for i, _ := range rf.peers {
-				if i == rf.me {
-					continue
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(i int) {
+			defer func() {
+				if atomic.AddInt32(&total, -1) == 0 {
+					if successNum < half+1 {
+						log.Printf("Term(%d): Leader peer(%d) is NOT working fine on Leader",
+							rf.currentTerm, rf.me)
+						rf.lock.Lock()
+						rf.state = Follower
+						rf.lock.Unlock()
+					}
+					close(done)
 				}
 
-				go func(i int) {
-					defer func() {
-						if atomic.AddInt32(&total, -1) == 0 {
-							if successNum < half+1 {
-								log.Printf("Term(%d): Leader peer(%d) is NOT working fine on Leader",
-									rf.currentTerm, rf.me)
-								rf.lock.Lock()
-								rf.state = Follower
-								rf.lock.Unlock()
-							}
-							close(done)
-						}
+			}()
 
-					}()
+			reply := &AppendEntriesReply{}
+			rf.sendHeartbeatRequset(i, args, reply)
 
-					reply := &AppendEntriesReply{}
-					rf.sendHeartbeatRequset(i, args, reply)
-
-					if reply.Success {
-						if atomic.AddInt32(&successNum, 1) == half+1 {
-							// log.Printf("Term(%d): Leader peer(%d) is working fine on Leader",
-							// rf.currentTerm, rf.me)
-							close(finish)
-						}
-					}
-
-				}(i)
+			if reply.Success {
+				if atomic.AddInt32(&successNum, 1) == half+1 {
+					log.Printf("Term(%d): Leader peer(%d) is working fine on Leader",
+						rf.currentTerm, rf.me)
+					close(finish)
+				}
 			}
-			select {
-			case <-done:
-			case <-finish:
-			case <-rf.done:
-			}
-		case <-quit:
-			log.Printf("Term(%d): Leader peer(%d) quit", rf.currentTerm, rf.me)
-			heartbeatTicker.Stop()
-			return
-		}
+
+		}(i)
+	}
+	select {
+	case <-done:
+	case <-finish:
+	case <-rf.done:
 	}
 
 	return

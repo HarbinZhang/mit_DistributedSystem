@@ -94,7 +94,7 @@ type Raft struct {
 	// the current leader ID, -1 means none
 	leaderID int
 	// wake up if leader changes
-	// leaderChange      chan struct{}
+	leaderChange      chan struct{}
 	lastHeartbeatTime time.Time
 	// logBase           int
 
@@ -103,6 +103,7 @@ type Raft struct {
 	votedFor    int // -1 means none
 	log         []LogEntry
 
+	// leaderChange chan struct{}
 	// Volatile state on all servers
 	// commitIndex int
 	// lastApplied int
@@ -219,6 +220,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	log.Printf("Term(%d): peer(%d) grants a vote to peer(%d)", rf.currentTerm, rf.me, args.CandidateID)
 
+	select {
+	case rf.resetElectionTimer <- struct{}{}:
+	default:
+	}
+
 	// rf.lock.Lock()
 	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidateID
@@ -231,10 +237,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// term
 	// follow it
+
+	select {
+	case rf.resetElectionTimer <- struct{}{}:
+	default:
+	}
+
+	log.Printf("Term(%d): peer(%d) got heartbeat from peer(%d)", rf.currentTerm, rf.me, args.LeaderId)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 	} else {
+
 		reply.Success = true
 		reply.Term = rf.currentTerm
 		rf.lock.Lock()
@@ -246,7 +260,8 @@ func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 		rf.state = Follower
 		rf.lastHeartbeatTime = time.Now()
 
-		rf.resetElectionTimer <- struct{}{}
+		// rf.resetElectionTimer <- struct{}{}
+
 	}
 
 }
@@ -343,8 +358,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeartbeatTime = time.Now()
 	// Your initialization code here (2A, 2B, 2C).
 	rf.done = make(chan struct{})
-	// rf.resetElectionTimer = make(chan struct{})
-	// rf.leaderChange = make(chan struct{})
+	rf.resetElectionTimer = make(chan struct{})
+	rf.leaderChange = make(chan struct{})
 	// rf.applySignal = make(chan struct{})
 	rf.leaderID = -1
 	rf.votedFor = -1
