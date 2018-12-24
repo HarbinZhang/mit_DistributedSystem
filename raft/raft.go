@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"log"
 	"mit/src/labrpc"
 	"sync"
@@ -59,13 +60,20 @@ type LogEntry struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Status        int // 0 for success, 1 for log inconsistency, 2 for old term
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 //
@@ -86,7 +94,7 @@ type Raft struct {
 	heartbeatReplyChan chan *AppendEntriesReply
 
 	// singal to apply a committed index
-	// applySignal chan struct{}
+	applySignal chan struct{}
 	// // indicates whether the server is done
 	done chan struct{}
 	// // indicates whether the election timer resets
@@ -105,12 +113,12 @@ type Raft struct {
 
 	// leaderChange chan struct{}
 	// Volatile state on all servers
-	// commitIndex int
-	// lastApplied int
+	commitIndex int
+	lastApplied int
 
 	// Volatile state on leaders
-	// nextIndex  []int
-	// matchIndex []int
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -165,10 +173,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateID int
-	// LastLogIndex int
-	// LastLogTerm  int
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -218,6 +226,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	if n := len(rf.log); n > 0 {
+		lastLogTerm := rf.log[n-1].Term
+		// at least as up-to-date as receiver's log
+		if args.LastLogTerm < lastLogTerm ||
+			args.LastLogTerm == lastLogTerm && args.LastLogIndex < n-1 {
+			return
+		}
+	}
+
 	log.Printf("Term(%d): peer(%d) grants a vote to peer(%d)", rf.currentTerm, rf.me, args.CandidateID)
 
 	select {
@@ -238,15 +255,11 @@ func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// term
 	// follow it
 
-	select {
-	case rf.resetElectionTimer <- struct{}{}:
-	default:
-	}
-
-	log.Printf("Term(%d): peer(%d) got heartbeat from peer(%d)", rf.currentTerm, rf.me, args.LeaderId)
+	// log.Printf("Term(%d): peer(%d) got heartbeat from peer(%d)", rf.currentTerm, rf.me, args.LeaderId)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		return
 	} else {
 
 		reply.Success = true
@@ -262,6 +275,11 @@ func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 		// rf.resetElectionTimer <- struct{}{}
 
+	}
+
+	select {
+	case rf.resetElectionTimer <- struct{}{}:
+	default:
 	}
 
 }
@@ -296,10 +314,10 @@ func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 // the struct itself.
 //
 
-// func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-// 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-// 	return ok
-// }
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -316,10 +334,24 @@ func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.lock.Lock()
+	defer rf.lock.Unlock()
 
+	index := -1
+	term := rf.currentTerm
+	isLeader := rf.leaderID == rf.me
+
+	if isLeader {
+		index = len(rf.log)
+		rf.log = append(rf.log, LogEntry{
+			Command: command,
+			Term:    term,
+		})
+
+		log.Printf("Term(%d): peer(%d) starts a replication with index(%d) log(%v)",
+			rf.currentTerm, rf.me, index, rf.log[index])
+
+	}
 	// Your code here (2B).
 
 	return index, term, isLeader
@@ -333,6 +365,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	close(rf.done)
 }
 
 //
@@ -360,18 +393,99 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.done = make(chan struct{})
 	rf.resetElectionTimer = make(chan struct{})
 	rf.leaderChange = make(chan struct{})
-	// rf.applySignal = make(chan struct{})
+	rf.applySignal = make(chan struct{})
 	rf.leaderID = -1
 	rf.votedFor = -1
-	// rf.commitIndex = -1
-	// rf.lastApplied = -1
-	// rf.nextIndex = make([]int, len(peers))
-	// rf.matchIndex = make([]int, len(peers))
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.election()
+	go rf.application(applyCh)
 
 	return rf
+}
+
+func (rf *Raft) application(ch chan<- ApplyMsg) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rf.done:
+			return
+		case <-rf.applySignal:
+			rf.apply(ch)
+		case <-ticker.C:
+			rf.apply(ch)
+		}
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.lock.Lock()
+	defer rf.lock.Unlock()
+
+	log.Printf("Term(%d): peer(%d) got AppendEntries(%d) from peer(%d) with term(%d), prevLogIndex(%d), leaderCommit(%d)",
+		rf.currentTerm, rf.me, len(args.Entries), args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit)
+
+	if args.PrevLogIndex >= 0 {
+		fmt.Println(rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, rf.me)
+	}
+	// Old term
+	if args.Term < rf.currentTerm {
+		reply.Status = 2
+		return
+	}
+
+	// log inconsistency
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Status = 1
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
+		return
+	}
+
+	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+		reply.Status = 1
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		i := args.PrevLogIndex
+		for i > 0 && rf.log[i-1].Term == reply.ConflictTerm {
+			i--
+		}
+		reply.ConflictIndex = i
+		return
+	}
+
+	rf.resetLeader(args.LeaderId)
+
+	var i, j int
+	for i, j = args.PrevLogIndex+1, 0; i < len(rf.log) && j < len(args.Entries); i, j = i+1, j+1 {
+		// checking confliction
+		if rf.log[i].Term != args.Entries[j].Term {
+			break
+		}
+	}
+
+	lastNewEntry := i - 1
+	if j < len(args.Entries) {
+		if i < len(rf.log) {
+			log.Printf("Term(%d): peer(%d) discards %d entries", rf.currentTerm, rf.me, len(rf.log)-i)
+		}
+		rf.log = append(rf.log[:i], args.Entries[j:]...)
+		lastNewEntry = len(rf.log) - 1
+	}
+
+	log.Printf("Term(%d): peer(%d) entries: %v", rf.currentTerm, rf.me, rf.log)
+	if args.LeaderCommit > rf.commitIndex && lastNewEntry >= 0 {
+		rf.commit(min(args.LeaderCommit, lastNewEntry))
+	}
+
+	reply.Term = rf.currentTerm
+	reply.Status = 0
 }
