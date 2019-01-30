@@ -18,8 +18,9 @@ package raft
 //
 
 import (
-	"fmt"
+	"bytes"
 	"log"
+	"mit/src/labgob"
 	"mit/src/labrpc"
 	"sync"
 	"time"
@@ -89,9 +90,9 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	state              RaftState
-	voteReplyChan      chan *RequestVoteReply
-	heartbeatReplyChan chan *AppendEntriesReply
+	state RaftState
+	// voteReplyChan      chan *RequestVoteReply
+	// heartbeatReplyChan chan *AppendEntriesReply
 
 	// singal to apply a committed index
 	applySignal chan struct{}
@@ -124,7 +125,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	rf.lock.RLock()
+	defer rf.lock.RUnlock()
 	// Your code here (2A).
 	return rf.currentTerm, rf.leaderID == rf.me
 }
@@ -137,12 +139,16 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
+	log.Printf("peer(%d) persisted: %v, %v, %v", rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 //
@@ -152,19 +158,40 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var (
+		currentTerm, votedFor int
+		entries               []LogEntry
+		err                   error
+	)
+
+	err = d.Decode(&currentTerm)
+	if err != nil {
+		log.Fatal("decoding currentTerm failed:", err)
+	}
+
+	err = d.Decode(&votedFor)
+	if err != nil {
+		log.Fatal("decoding votedFor failed:", err)
+	}
+
+	err = d.Decode(&entries)
+	if err != nil {
+		log.Fatal("decoding log failed:", err)
+		return
+	}
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = entries
+
+	log.Printf("peer(%d) readPersist: %v, %v, %v", rf.me, rf.currentTerm, rf.votedFor, rf.log)
+
 }
 
 //
@@ -193,8 +220,8 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 const (
-	minHeartbeatTimeout = 20
-	minElectionTimeout  = 150
+	minHeartbeatTimeout = 50
+	minElectionTimeout  = 100
 )
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -202,27 +229,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lock.Lock()
 	defer rf.lock.Unlock()
 
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
-
-	// the leader is alive
-	if time.Since(rf.lastHeartbeatTime) < minElectionTimeout*time.Millisecond {
-		log.Println("Leader still alive")
-		return
-	}
-
 	log.Printf("Term(%d): peer(%d) got RequestVote from peer(%d) with term(%d)",
 		rf.currentTerm, rf.me, args.CandidateID, args.Term)
 
-	// Candidate term is old
-	if args.Term <= rf.currentTerm {
-		log.Println("Candidate term is old")
+	// the leader is alive
+	if time.Since(rf.lastHeartbeatTime) < minElectionTimeout*time.Millisecond {
+		log.Printf("Leader(%d) still alive", rf.leaderID)
 		return
+	}
+
+	// Candidate term is old
+	if args.Term < rf.currentTerm {
+		log.Println("Candidate term is old argsTerm, currentTerm", args.Term, rf.currentTerm)
+		return
+	}
+
+	// reset election
+	rf.resetElection()
+
+	needToPersist := false
+	defer func() {
+		if needToPersist {
+			rf.persist()
+		}
+	}()
+
+	// ???
+	if rf.resetState(args.Term) {
+		needToPersist = true
+		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, Follower)
 	}
 
 	// rf already has a vote
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
-		log.Println("rf already has a vote")
+		log.Printf("rf(%d) already has a vote:%d", rf.me, rf.votedFor)
 		return
 	}
 
@@ -231,58 +271,54 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// at least as up-to-date as receiver's log
 		if args.LastLogTerm < lastLogTerm ||
 			args.LastLogTerm == lastLogTerm && args.LastLogIndex < n-1 {
+			log.Printf(" args(term:%d,index:%d) not at least as up-to-date as receiver's log(%d, %d)",
+				args.LastLogTerm, args.LastLogIndex, lastLogTerm, n)
 			return
 		}
 	}
 
 	log.Printf("Term(%d): peer(%d) grants a vote to peer(%d)", rf.currentTerm, rf.me, args.CandidateID)
 
-	select {
-	case rf.resetElectionTimer <- struct{}{}:
-	default:
-	}
-
-	// rf.lock.Lock()
-	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidateID
 	rf.state = Follower
-	// rf.lock.Unlock()
-	reply.Term = args.Term
+	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+	needToPersist = true
 }
 
-func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// term
-	// follow it
+// func (rf *Raft) Heartbeat(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+// 	// term
+// 	// follow it
 
-	// log.Printf("Term(%d): peer(%d) got heartbeat from peer(%d)", rf.currentTerm, rf.me, args.LeaderId)
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
-	} else {
+// 	// log.Printf("Term(%d): peer(%d) got heartbeat from peer(%d)", rf.currentTerm, rf.me, args.LeaderId)
+// 	if args.Term < rf.currentTerm {
+// 		reply.Term = rf.currentTerm
+// 		reply.Success = false
+// 		return
+// 	} else {
 
-		reply.Success = true
-		reply.Term = rf.currentTerm
-		rf.lock.Lock()
-		defer rf.lock.Unlock()
-		if rf.state == Leader {
-			rf.done <- struct{}{}
-		}
-		rf.leaderID = args.LeaderId
-		rf.state = Follower
-		rf.lastHeartbeatTime = time.Now()
+// 		reply.Success = true
+// 		reply.Term = rf.currentTerm
+// 		rf.lock.Lock()
+// 		defer rf.lock.Unlock()
+// 		if rf.state == Leader {
+// 			rf.done <- struct{}{}
+// 		}
+// 		rf.leaderID = args.LeaderId
+// 		rf.state = Follower
+// 		rf.lastHeartbeatTime = time.Now()
 
-		// rf.resetElectionTimer <- struct{}{}
+// 		// rf.resetElectionTimer <- struct{}{}
+// 		rf.currentTerm = args.Term
 
-	}
+// 	}
 
-	select {
-	case rf.resetElectionTimer <- struct{}{}:
-	default:
-	}
+// 	select {
+// 	case rf.resetElectionTimer <- struct{}{}:
+// 	default:
+// 	}
 
-}
+// }
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -351,6 +387,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		log.Printf("Term(%d): peer(%d) starts a replication with index(%d) log(%v)",
 			rf.currentTerm, rf.me, index, rf.log[index])
 
+		rf.persist()
 	}
 	// Your code here (2B).
 
@@ -386,8 +423,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	rf.voteReplyChan = make(chan *RequestVoteReply, len(peers))
-	rf.heartbeatReplyChan = make(chan *AppendEntriesReply, len(peers))
+	// rf.voteReplyChan = make(chan *RequestVoteReply, len(peers))
+	// rf.heartbeatReplyChan = make(chan *AppendEntriesReply, len(peers))
 	rf.lastHeartbeatTime = time.Now()
 	// Your initialization code here (2A, 2B, 2C).
 	rf.done = make(chan struct{})
@@ -433,9 +470,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	log.Printf("Term(%d): peer(%d) got AppendEntries(%d) from peer(%d) with term(%d), prevLogIndex(%d), leaderCommit(%d)",
 		rf.currentTerm, rf.me, len(args.Entries), args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit)
 
-	if args.PrevLogIndex >= 0 {
-		fmt.Println(rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, rf.me)
-	}
+	// if args.PrevLogIndex >= 0 {
+	// 	fmt.Println(rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, rf.me)
+	// }
 	// Old term
 	if args.Term < rf.currentTerm {
 		reply.Status = 2
@@ -462,6 +499,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.resetElection()
+
+	// ???
+	needToPersist := false
+
+	defer func() {
+		if needToPersist {
+			rf.persist()
+		}
+	}()
+
+	if rf.resetState(args.Term) {
+		needToPersist = true
+		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, Follower)
+	}
 	rf.resetLeader(args.LeaderId)
 
 	var i, j int

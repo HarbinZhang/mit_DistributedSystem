@@ -24,7 +24,7 @@ func (rf *Raft) election() {
 	for {
 		if _, isLeader := rf.GetState(); isLeader {
 			// electionTimeout = time.Duration(rand.Intn(25)+minHeartbeatTimeout) * time.Millisecond
-			electionTimeout = time.Duration(rand.Intn(20)+minHeartbeatTimeout) * time.Millisecond
+			electionTimeout = time.Duration(rand.Intn(25)+minHeartbeatTimeout) * time.Millisecond
 		} else {
 			electionTimeout = time.Duration(rand.Intn(200)+minElectionTimeout) * time.Millisecond
 		}
@@ -36,7 +36,7 @@ func (rf *Raft) election() {
 				log.Printf("Term(%d): peer(%d) starts a periodical heartbeat", rf.currentTerm, rf.me)
 				rf.lock.RUnlock()
 
-				go rf.sendHeartbeat()
+				// go rf.sendHeartbeat()
 				go rf.replicate(100)
 			} else {
 				rf.lock.RLock()
@@ -46,12 +46,15 @@ func (rf *Raft) election() {
 				go rf.elect()
 			}
 		case <-rf.leaderChange:
+			fmt.Println("wo")
 			if _, isLeader := rf.GetState(); isLeader {
 				rf.lock.RLock()
 				log.Printf("Term(%d): peer(%d) starts an instant heartbeat", rf.currentTerm, rf.me)
 				rf.lock.RUnlock()
-				// go rf.replicate(0)
-				go rf.sendHeartbeat()
+				go rf.replicate(0)
+				// go rf.sendHeartbeat()
+			} else {
+				fmt.Println("not the leader", rf.leaderID)
 			}
 		case <-rf.resetElectionTimer:
 			rf.lock.RLock()
@@ -75,19 +78,26 @@ func (rf *Raft) elect() {
 	fmt.Println("Into elect")
 
 	rf.lock.Lock()
-	rf.votedFor = -1
+
+	rf.persist()
+	rf.votedFor = rf.me
+	rf.resetLeader(-1)
+	// rf.leaderID = rf.me
 	rf.state = Candidate
 	rf.currentTerm++
-	rf.lock.Unlock()
 
 	req := &RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateID: rf.me,
 	}
+	// ???: because of index
 	req.LastLogIndex = len(rf.log) - 1
-	if req.LastLogIndex > 0 {
+	if req.LastLogIndex >= 0 {
 		req.LastLogTerm = rf.log[req.LastLogIndex].Term
+		fmt.Println(rf.log)
 	}
+
+	rf.lock.Unlock()
 
 	voted := int32(1)
 	total := int32(len(rf.peers))
@@ -95,7 +105,7 @@ func (rf *Raft) elect() {
 
 	done := make(chan struct{})
 	finish := make(chan struct{})
-	for i, _ := range rf.peers {
+	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
@@ -122,21 +132,21 @@ func (rf *Raft) elect() {
 				return
 			}
 
+			if rf.resetState(reply.Term) {
+				rf.persist()
+				log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, Follower)
+			}
+
 			if reply.VoteGranted {
 				log.Printf("Term(%d): peer(%d) got a vote from peer(%d)", req.Term, rf.me, i)
 				if atomic.AddInt32(&voted, 1) == half+1 {
 
 					log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
 					// rf.resetLeader(rf.me)
-
-					rf.leaderID = rf.me
-					rf.state = Leader
-
-					fmt.Println(rf.GetState())
-
-					rf.leaderChange <- struct{}{}
-
 					close(finish)
+					fmt.Println(rf.leaderID)
+					rf.resetLeader(rf.me)
+					rf.state = Leader
 
 					for i := 0; i < len(rf.matchIndex); i++ {
 						if i != rf.me {
@@ -161,84 +171,6 @@ func (rf *Raft) elect() {
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendHeartbeat() {
-	// if rf.state != Leader {
-	// 	log.Panicln("Not the leader.")
-	// 	return
-	// }
-	args := &AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-
-	// Don't need to set itself lastHeartbeatTime
-	// rf.lock.Lock()
-	// rf.lastHeartbeatTime = time.Now()
-	// rf.lock.Unlock()
-
-	total := int32(len(rf.peers))
-	successNum := int32(1)
-	half := total / 2
-
-	done := make(chan struct{})
-	finish := make(chan struct{})
-
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		go func(i int) {
-			defer func() {
-				if atomic.AddInt32(&total, -1) == 0 {
-					if successNum < half+1 {
-						log.Printf("Term(%d): Leader peer(%d) is NOT working fine on Leader",
-							rf.currentTerm, rf.me)
-						rf.lock.Lock()
-						rf.state = Follower
-						rf.lock.Unlock()
-					}
-					close(done)
-				}
-
-			}()
-
-			reply := &AppendEntriesReply{}
-			rf.sendHeartbeatRequset(i, args, reply)
-
-			if reply.Success {
-				if atomic.AddInt32(&successNum, 1) == half+1 {
-					log.Printf("Term(%d): Leader peer(%d) is working fine on Leader",
-						rf.currentTerm, rf.me)
-					close(finish)
-				}
-			} else {
-				rf.lock.Lock()
-				log.Printf("Term(%d): sent Raft.Heartbeat RPC from peer(%d) to peer(%d) failed",
-					args.Term, rf.me, i)
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.state = Follower
-				}
-				rf.lock.Unlock()
-			}
-
-		}(i)
-	}
-	select {
-	case <-done:
-	case <-finish:
-	case <-rf.done:
-	}
-
-	return
-}
-
-func (rf *Raft) sendHeartbeatRequset(i int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[i].Call("Raft.Heartbeat", args, reply)
 	return ok
 }
 
@@ -349,6 +281,11 @@ func (rf *Raft) replicate(maxSize int) {
 					return
 				}
 
+				if rf.resetState(reply.Term) {
+					rf.persist()
+					log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, Follower)
+				}
+
 				switch reply.Status {
 				case 0: // success
 					if len(args.Entries) > 0 {
@@ -429,10 +366,28 @@ func (rf *Raft) replicate(maxSize int) {
 func (rf *Raft) resetLeader(i int) {
 	if rf.leaderID != i {
 		rf.leaderID = i
-
 		select {
 		case rf.leaderChange <- struct{}{}:
 		default:
 		}
+	}
+}
+
+func (rf *Raft) resetState(term int) bool {
+	if term > rf.currentTerm {
+		rf.currentTerm = term
+		rf.votedFor = -1
+		rf.resetLeader(-1)
+		rf.state = Follower
+		return true
+	}
+
+	return false
+}
+
+func (rf *Raft) resetElection() {
+	select {
+	case rf.resetElectionTimer <- struct{}{}:
+	default:
 	}
 }
